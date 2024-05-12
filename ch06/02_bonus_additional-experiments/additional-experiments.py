@@ -20,6 +20,31 @@ from gpt_download import download_and_load_gpt2
 from previous_chapters import GPTModel, load_weights_into_gpt
 
 
+class LoRALayer(torch.nn.Module):
+    def __init__(self, in_dim, out_dim, rank, alpha):
+        super().__init__()
+        std_dev = 1 / torch.sqrt(torch.tensor(rank).float())
+        self.A = torch.nn.Parameter(torch.randn(in_dim, rank) * std_dev)
+        self.B = torch.nn.Parameter(torch.zeros(rank, out_dim))
+        self.alpha = alpha
+
+    def forward(self, x):
+        x = self.alpha * (x @ self.A @ self.B)
+        return x
+
+
+class LinearWithLoRA(torch.nn.Module):
+    def __init__(self, linear, rank, alpha):
+        super().__init__()
+        self.linear = linear
+        self.lora = LoRALayer(
+            linear.in_features, linear.out_features, rank, alpha
+        )
+
+    def forward(self, x):
+        return self.linear(x) + self.lora(x)
+
+
 class SpamDataset(Dataset):
     def __init__(self, csv_file, tokenizer, max_length=None, pad_token_id=50256):
         self.data = pd.read_csv(csv_file)
@@ -139,7 +164,7 @@ def instantiate_model(choose_model, load_weights):
 
 def calc_loss_batch(input_batch, target_batch, model, device, trainable_token=-1):
     input_batch, target_batch = input_batch.to(device), target_batch.to(device)
-    logits = model(input_batch)[:, trainable_token, :]  # Logits of last ouput token
+    logits = model(input_batch)[:, trainable_token, :]  # Logits of last output token
     loss = torch.nn.functional.cross_entropy(logits, target_batch)
     return loss
 
@@ -175,7 +200,7 @@ def calc_accuracy_loader(data_loader, model, device, num_batches=None, trainable
     for i, (input_batch, target_batch) in enumerate(data_loader):
         if i < num_batches:
             input_batch, target_batch = input_batch.to(device), target_batch.to(device)
-            logits = model(input_batch)[:, trainable_token, :]  # Logits of last ouput token
+            logits = model(input_batch)[:, trainable_token, :]  # Logits of last output token
             predicted_labels = torch.argmax(logits, dim=-1)
 
             num_examples += predicted_labels.shape[0]
@@ -238,6 +263,16 @@ def train_classifier_simple(model, train_loader, val_loader, optimizer, device, 
     return train_losses, val_losses, train_accs, val_accs, examples_seen
 
 
+def replace_linear_with_lora(model, rank, alpha):
+    for name, module in model.named_children():
+        if isinstance(module, torch.nn.Linear):
+            # Replace the Linear layer with LinearWithLoRA
+            setattr(model, name, LinearWithLoRA(module, rank, alpha))
+        else:
+            # Recursively apply the same function to child modules
+            replace_linear_with_lora(module, rank, alpha)
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -263,7 +298,7 @@ if __name__ == "__main__":
         type=str,
         default="last_block",
         help=(
-            "Which layers to train. Options: 'all', 'last_block', 'last_layer'."
+            "Which layers to train. Options: 'all', 'last_block', 'last_layer', 'lora'."
         )
     )
     parser.add_argument(
@@ -281,6 +316,22 @@ if __name__ == "__main__":
         help=(
             "The context length of the data inputs."
             "Options: 'longest_training_example', 'model_context_length' or integer value."
+        )
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=8,
+        help=(
+            "The LoRA rank when choosing `--trainable_layers lora`"
+        )
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=8,
+        help=(
+            "The LoRA alpha value when choosing `--trainable_layers lora`"
         )
     )
 
@@ -315,7 +366,7 @@ if __name__ == "__main__":
     elif args.model_size == "gpt2-large (774M)":
         in_features = 1280
     elif args.model_size == "gpt2-xl (1558M)":
-        in_features = 1280
+        in_features = 1600
     else:
         raise ValueError("Invalid --model_size argument")
 
@@ -332,6 +383,8 @@ if __name__ == "__main__":
     elif args.trainable_layers == "all":
         for param in model.parameters():
             param.requires_grad = True
+    elif args.trainable_layers == "lora":
+        replace_linear_with_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
     else:
         raise ValueError("Invalid --trainable_layers argument.")
 
